@@ -1,0 +1,306 @@
+library 'reference-pipeline'
+
+
+pipeline{
+
+	agent any
+	OR
+	agent{
+		docker{
+			label 'docker_name'
+			image 'image_name'
+		}
+	}
+	
+	options{
+		buildDiscarder(logRotator(numToKeepStr: '10')) #n number of latest builds to be present in Jenkins console
+	}
+	
+	parameters{
+		choice(name: 'ENV', choices: 'L3\nPROD', description: 'Select target environment')
+		choice(name: 'Action', choices: 'Deploy\nUndeploy\nBuild', description: 'Select target action')
+	}
+	
+	tools{
+		jdk 'JAVA_8'
+		maven 'Maven 3.3.3'
+		gradle 'Gradle_6.5'
+	}
+	
+	environment{
+		#Define all the variables name
+		App_number = "123"
+		App_name = 'abc'
+		SSH_OPTIONS = '-o StrictHostKeyChecking=no -oBatchMode=yes -oLogLevel=error -oUserKnownHostsFile=/dev/null'
+		#Nexus-Creds
+		SVC_ACCT_LOGIN = credentials('Nexus')
+		SVC_ACCT_LOGIN_USER = "${SVC_ACCT_LOGIN_USR}"
+		SVC_ACCT_LOGIN_PASS = "${SVC_ACCT_LOGIN_PASS}"
+		
+		JRE_PATH='/opt/java/hotspot/8/64bit/jdk_version'
+		SSH_Agent='SSH_AGENT_NAME'
+		SSH_User='CM_USER_FOR_APP'
+		
+		L3_HOSTS='VM_name1,VM_name2,VM_name3,VM_namen'
+		LP_HOSTS='VM_name1,VM_name2,VM_name3,VM_namen'
+	}
+	
+	stages{
+		
+		stage('Codecheckout'){
+			steps{
+				checkout([$class: 'GitSCM', branches: [[name: '/*branchname']], extensions: [], userRemoteConfigs: [[credentialsId: 'Jenkins_Github_creds',url:'git@github.com:GITHUBrepo']]])
+			}
+		}
+		
+		stage('Extract_Version_from_build.properties')
+		{
+			steps{
+				script{
+					def firstLine = sh(script: 'grep -m 1 "." /Path/to/build.properties', returnStdout: true).trim()
+					echo "FirstLine = ${firstLine}"
+					def varValue = firstLine.split('=')[1].trim()
+					echo "Appversion = ${varValue}"
+					
+					env.appVersion = varValue  #Making varValue as environment variable so that we can use it in future stages
+					echo "${env.appVersion}"
+				}
+			}
+		}
+		
+		stage('Update files acording to env')
+		{
+			when{
+				environment name: 'ACTION', value: 'Deploy'
+			}
+			steps{
+				script{
+					sh '''
+					if [ ${ENV} == L3 ]
+					then 
+						cp ./path/to/specefic/L3/file ./path/to/default/file
+					fi
+					
+					if [ ${ENV} == PROD ]
+					then 
+						cp ./path/to/specefic/LP/file ./path/to/default/file
+					fi
+					'''
+				}
+			}
+		}    #This step copies the environment specefic file to the default file Like properties file or config files
+		
+		stage('Build')
+		{
+			when{
+				anyOf{
+					environment name: 'ACTION', value: 'Deploy'
+					environment name: 'ACTION', value: 'Build'
+				}
+			}
+			
+			steps{
+				dir("${env.WORKSPACE}"){    #Goes into the specefic directory
+					sh "pwd"  				#Gives the complete folder path
+					sh "ls -al"				#Lists all the files present in the current directory
+					sh "gradle buildComponent" 			#Builds the application
+					sh "gradle buildInstallTarFile"   	#Installs the build file to a tar   The above 2 lines may differ accorduing to the application
+					
+					sh "tar -xvf FILENAME.tar" 			#Extracts/Unzips the tar file 
+				}
+			}
+		}
+		
+		stage('Nexus')
+		{
+			when{
+				anyOf{
+					environment name: 'ACTION', value: 'Build'
+				}
+			}
+			steps{
+				nexusPolicyEvaluation iqApplication: 'APP_ID', iqInstanceID: 'NEXUSIQSERVER', iqStage: 'build'
+			}
+		}
+		
+		stage('Copying-Artifacts')
+		{
+			when{
+				anyOf{
+					environment name: 'ACTION', value: 'Deploy'
+				}
+			}
+			steps{
+				script{
+					sshagent([SSH_Agent])
+					{
+						L3_HOSTS.split(',').each { L3_HOST ->
+						
+						sh """
+						#!/bin/bash
+							if [$ENV == L3]
+							then
+								ssh ${SSH_OPTIONS} ${SSH_User}@${L3_HOST} 'cd /Home/directory && rm -rf FILENAME.tar'
+								ssh ${SSH_OPTIONS} ${SSH_User}@${L3_HOST} 'cd /Home/directory && rm -rf current'
+								
+								scp ${SSH_OPTIONS} ${WORKSPACE}/path/to/FILENAME.tar ${SSH_User}@${L3_HOST}:/Path/to/deploy/dir/
+								scp ${SSH_OPTIONS} ${WORKSPACE}/path/to/L3/env/files ${SSH_User}@${L3_HOST}:/Path/to/deploy/dir/L3
+								ssh ${SSH_OPTIONS} ${SSH_User}@${L3_HOST} 'cd /Home/directory && tar -xvf FILENAME.tar'
+								ssh ${SSH_OPTIONS} ${SSH_User}@${L3_HOST} 'ln -s /Home/directory VERSION/current'
+							fi
+						"""
+						}
+						
+						
+						LP_HOSTS.split(',').each { LP_HOST ->
+						
+						sh """
+						#!/bin/bash
+							if [$ENV == LP]
+							then
+								ssh ${SSH_OPTIONS} ${SSH_User}@${LP_HOST} 'cd /Home/directory && rm -rf FILENAME.tar'
+								ssh ${SSH_OPTIONS} ${SSH_User}@${LP_HOST} 'cd /Home/directory && rm -rf current'
+								
+								scp ${SSH_OPTIONS} ${WORKSPACE}/path/to/FILENAME.tar ${SSH_User}@${LP_HOST}:/Path/to/deploy/dir/
+								scp ${SSH_OPTIONS} ${WORKSPACE}/path/to/LP/env/files ${SSH_User}@${LP_HOST}:/Path/to/deploy/dir/LP
+								ssh ${SSH_OPTIONS} ${SSH_User}@${LP_HOST} 'cd /Home/directory && tar -xvf FILENAME.tar'
+								ssh ${SSH_OPTIONS} ${SSH_User}@${LP_HOST} 'ln -s /Home/directory VERSION/current'
+							fi
+						"""
+						}
+					}
+				}
+			}
+		}
+		# First ssh command deletes the old zip file; Second ssh command deletes the softlink; First scp command copies the new zip file created to VM location;
+		# Second scp command copies the Environment specefic files to specefic VM location; Third ssh command Unzips the newly built ZIP file in specefic directory inside VM; Forth ssh comand creates a softlink
+						
+						
+		stage('Prerequisite')
+		{
+			when{
+				anyOf{
+					environment name: 'ACTION', value: 'Deploy'
+				}
+			}
+			steps{
+				script{
+					sshagent([SSH_Agent])
+					{
+						L3_HOSTS.split(',').each { L3_HOST ->
+						
+						sh """
+						#!/bin/bash
+							if [$ENV == L3]
+							then
+								ssh ${SSH_OPTIONS} ${SSH_User}@${L3_HOST} 'cd /Path/to/deploy/dir/L3/ && ./L3_Filename.sh
+								ssh ${SSH_OPTIONS} ${SSH_User}@${L3_HOST} 'cd /Path/to/deploy/dir/L3/ && ./L3_Filename.py
+							fi
+						"""
+						}
+						
+						
+						LP_HOSTS.split(',').each { LP_HOST ->
+						
+						sh """
+						#!/bin/bash
+							if [$ENV == LP]
+							then
+								ssh ${SSH_OPTIONS} ${SSH_User}@${LP_HOST} 'cd /Path/to/deploy/dir/LP/ && ./LP_Filename.sh
+								ssh ${SSH_OPTIONS} ${SSH_User}@${LP_HOST} 'cd /Path/to/deploy/dir/LP/ && ./LP_Filename.py
+							fi
+						"""
+						}
+					}
+				}
+			}
+		}
+		# ssh command go into the directory and calls the specefic shell script
+		
+						
+		stage('Start')
+		{
+			when{
+				anyOf{
+					environment name: 'ACTION', value: 'Deploy'
+				}
+			}
+			steps{
+				script{
+					sshagent([SSH_Agent])
+					{
+						L3_HOSTS.split(',').each { L3_HOST ->
+						
+						sh """
+						#!/bin/bash
+							if [$ENV == L3]
+							then
+								ssh ${SSH_OPTIONS} ${SSH_User}@${L3_HOST} 'cd /Path/to/deploy/dir/L3/ && ./L3_env.sh && ./L3_start.sh
+								ssh ${SSH_OPTIONS} ${SSH_User}@${L3_HOST} "nohup java ${jvrargs} ${Arguements} -jar /Path/to/File/name.jar"  
+							fi
+						"""
+						}
+						
+						
+						LP_HOSTS.split(',').each { LP_HOST ->
+						
+						sh """
+						#!/bin/bash
+							if [$ENV == LP]
+							then
+								ssh ${SSH_OPTIONS} ${SSH_User}@${LP_HOST} 'cd /Path/to/deploy/dir/LP/ && ./LP_env.sh && ./LP_start.sh
+							fi
+						"""
+						}
+					}
+				}
+			}
+		}
+		#First ssh command is to start the applications through scripts; Second ssh command is to start the application through jar file
+		
+		stage('Undeploy')
+		{
+			when{
+				anyOf{
+					environment name: 'ACTION', value: 'Undeploy'
+				}
+			}
+			steps{
+				script{
+					sshagent([SSH_Agent])
+					{
+						L3_HOSTS.split(',').each { L3_HOST ->
+						
+						sh """
+						#!/bin/bash
+							if [$ENV == L3]
+							then
+								ssh ${SSH_OPTIONS} ${SSH_User}@${L3_HOST} 'cd /Path/to/deploy/dir/L3/ && ./undeploy.sh
+							fi
+						"""
+						}
+						
+						
+						LP_HOSTS.split(',').each { LP_HOST ->
+						
+						sh """
+						#!/bin/bash
+							if [$ENV == LP]
+							then
+								ssh ${SSH_OPTIONS} ${SSH_User}@${LP_HOST} 'cd /Path/to/deploy/dir/LP/ && ./undeploy.sh
+							fi
+						"""
+						}
+					}
+				}
+			}
+		}
+		# ssh command go into the directory and calls the specefic shell script
+		
+		post{
+			always{
+				cleanWs()
+			}
+		}
+	}
+}

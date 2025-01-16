@@ -1,0 +1,462 @@
+library 'reference-pipeline'
+library 'AppServiceAccount'
+
+pipeline{
+   agent {
+       docker {
+           label 'docker'
+           image 'nexus2.prod.cloud.fedex.com:8444/fdx/jenkins/cloudops-terraform-image'
+       }
+   }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '05'))
+    }
+
+    parameters {
+        choice(name: 'ENVIRONMENT', choices: ['none',
+                                              'ephemeral-app-atl',
+                                              'ephemeral-resources-atl'])
+        choice(name: 'ACTION', choices: [ 'pipeline scan',
+                                          '--- Primary Operations ---',
+                                          'provision IaaS',
+                                          'provision all',
+                                          'deprovision all',
+                                          'deprovision IaaS',
+                                          '--- Individual Components ---',
+                                          'create goldcopy',
+                                          'provision DB',
+                                          'provision JMS topic',
+                                          'deploy SV',
+                                          'undeploy SV',
+                                          'deprovision JMS topic',
+                                          'deprovision DB',
+                                          'delete goldcopy'])
+    }
+
+    environment {
+        APP_NAME = 'FXF-Dimension-Targeting'
+        EAI_NUMBER = '6655'
+
+        GIT_BRANCH = "${env.BRANCH_NAME}"
+
+        OKTA_CREDS=credentials('eai6655_okta_credentials')
+        PROXY="internet.proxy.fedex.com:3128"
+
+        // IaaS/CloudOps
+        S3_CREDS=credentials('eai6655_s3_credentials')
+        S3_ENDPOINT="https://s3-cf.ecs.ute.fedex.com"
+
+
+        // App deploy/configure/start
+        // This needs to be the Jenkins Cred ID of the SSH key that was created for you
+        SSH_AGENT='hermes-keyper_app6655_devtest_eai6655'
+        // This needs to be the app user that you configured in your CloudOps Deployment
+        SSH_USER='eai6655'
+        // This can usually stay unchanged but changing the log level can be helpful in debugging ssh issues
+        SSH_OPTIONS='-oStrictHostKeyChecking=no -oBatchMode=yes -oLogLevel=error -oUserKnownHostsFile=/dev/null'
+        // This can usually stay unchanged if you are following standards
+        APP_BASE_DIR="/opt/fedex/${SSH_USER}"
+        // This can usually stay unchanged if you are following standards
+        APP_DIR = "${APP_BASE_DIR}/${APP_NAME}"
+        // This is an easy way to always have your scripts pointed to the right place.
+        CURRENT_DIR = "${APP_DIR}/current"
+
+        // Random
+        http_proxy=""
+        https_proxy=""
+        HTTP_PROXY=""
+        HTTPS_PROXY=""
+
+        // Service Virtualization
+        SERVICE_SRC_DIR = "env/service-virtualization"
+
+        //PDB and GoldCopy info
+        GOLD_COPY='svmt-ephemeral-gold-copy-v1'
+        PDB_LABELNAME='svmt-ephemeral-pdb-01'
+        GOLD_COPY_ID='1188'
+
+        // Wiremock
+        WIREMOCK_BASE_DIR = "${APP_BASE_DIR}/wiremock"
+        WIREMOCK_VERSION = "2.32.0"
+        WIREMOCK_ORIG_JAR_NAME = "wiremock-jre8-standalone-${WIREMOCK_VERSION}.jar"
+        WIREMOCK_JAR_NAME = "wiremock.jar"
+        WIREMOCK_DOWNLOAD = "https://nexus.prod.cloud.fedex.com:8443/nexus/repository/maven-central/com/github/tomakehurst/wiremock-jre8-standalone/${WIREMOCK_VERSION}/${WIREMOCK_ORIG_JAR_NAME}"
+        WIREMOCK_VERSION_DIR = "${WIREMOCK_BASE_DIR}/${WIREMOCK_VERSION}"
+        WIREMOCK_CURRENT_DIR = "${WIREMOCK_BASE_DIR}/current"
+        WIREMOCK_DEPLOY_FILES = "-r ${WIREMOCK_JAR_NAME} ${SERVICE_SRC_DIR}/wiremock/service/*"
+        WIREMOCK_STOP_CMD = './stop_wiremock'
+        WIREMOCK_START_CMD = "${WIREMOCK_STOP_CMD} && ./start_wiremock"
+
+    }
+
+    stages {
+
+        stage('Environment Properties') {
+            steps {
+                setEnvVars()
+            }
+        }
+
+        stage('Provision IaaS') {
+            when {
+                anyOf {
+                    environment name: 'ACTION', value: 'provision IaaS';
+                }
+            }
+            steps {
+                script {
+                    provisionVMs("${env.TF_DIR}", "${params.ENVIRONMENT}")
+                }
+            }
+        }
+
+        stage('Create goldcopy') {
+            when {
+                anyOf {
+                    environment name: 'ACTION', value: 'create goldcopy';
+                }
+            } 
+            steps {
+                script {
+                    creategoldcopy()
+                }
+            }
+        }
+
+        stage('Create DB') {
+            when {
+                anyOf {
+                    environment name: 'ACTION', value: 'provision DB';
+                    environment name: 'ACTION', value: 'provision all';
+                }
+            }
+            steps {
+                script {
+                    createDB()
+                }
+            }
+        }
+
+        stage("Provision JMS TOPIC") {
+            when {
+                anyOf {
+                    environment name: 'ACTION', value: 'provision JMS topic';
+                    environment name: 'ACTION', value: 'provision all';
+                    environment name: 'ACTION', value: 'all';
+                }
+            }
+            steps {
+                script {
+                    provisionJMS("TOPIC",
+                            env.MESSAGING_TOPIC_LOCATION,
+                            env.MESSAGING_TOPIC_LEVEL,
+                            "PUBLISHER",
+                            env.MESSAGING_TOPIC1_NAME)
+                    provisionJMS("TOPIC",
+                            env.MESSAGING_TOPIC_LOCATION,
+                            env.MESSAGING_TOPIC_LEVEL,
+                            "PUBLISHER",
+                            env.MESSAGING_TOPIC2_NAME)
+                }
+            }
+        }
+
+        stage("Deploy Service Virtualization")  {
+            when {
+                anyOf {
+                    environment name: 'ACTION', value: 'provision all';
+                    environment name: 'ACTION', value: 'deploy SV';
+                }
+            }
+            steps{
+                script {
+                    deployServiceVirtualization()
+                }
+            }
+        }
+
+        stage('Undeploy SV') {
+            when {
+                anyOf {
+                    environment name: 'ACTION', value: 'undeploy SV';
+                    environment name: 'ACTION', value: 'deprovision all';
+                }
+            }
+            steps {
+                script {
+                    undeployServiceVirtualization()
+                }
+            }
+        }
+
+        stage("Deprovision JMS TOPIC1") {
+            when {
+                anyOf {
+                    environment name: 'ACTION', value: 'deprovision JMS topic';
+                }
+            }
+            steps {
+                script {
+                    def provisionMap = deprovisionJMS("E.${EAI_NUMBER}.PUB.9178349.${env.MESSAGING_TOPIC_LOCATION}.TCF.${env.MESSAGING_TOPIC_LEVEL}.${params.ENVIRONMENT.toUpperCase()}")
+                }
+            }
+        }
+
+        stage("Deprovision JMS TOPIC2") {
+            when {
+                anyOf {
+                    environment name: 'ACTION', value: 'deprovision JMS topic';
+                }
+            }
+            steps {
+                script {
+                    def provisionMap = deprovisionJMS("E.${EAI_NUMBER}.PUB.9178463.${env.MESSAGING_TOPIC_LOCATION}.TCF.${env.MESSAGING_TOPIC_LEVEL}.${params.ENVIRONMENT.toUpperCase()}")
+                }
+            }
+        }
+
+        stage('Delete DB') {
+            when {
+                anyOf {
+                    environment name: 'ACTION', value: 'deprovision DB';
+                    environment name: 'ACTION', value: 'deprovision all';
+                }
+            }
+            steps {
+                script {
+                    deleteDB()
+                }
+            }
+        }
+
+        stage('delete goldcopy') {
+            when {
+                anyOf {
+                    environment name: 'ACTION', value: 'delete goldcopy';
+                }
+            }
+            steps {
+                script {
+                    deletegoldcopy()
+                }
+            }
+        }
+
+        stage('Deprovision IaaS') {
+            when {
+                anyOf {
+                    environment name: 'ACTION', value: 'deprovision IaaS'
+                }
+            }
+            steps {
+                deprovisionVMs("${env.TF_DIR}", "${params.ENVIRONMENT}")
+            }
+        }
+
+    }
+}
+
+def setEnvVars(){
+    script {
+        // Get environment properties
+        def props = readProperties file:"env/${env.ENVIRONMENT}.properties"
+
+        env.ENV_TYPE = props['ENV_TYPE']
+        env.LOCATIONS = props['LOCATIONS']
+        env.DEPLOY_TYPE = props['DEPLOY_TYPE']
+
+        env.IAAS_DEPLOYMENT_NAME = props['IAAS_DEPLOYMENT_NAME']
+        env.IAAS_INSTANCES = props['IAAS_INSTANCES']
+        env.IAAS_VM_SIZE = props['IAAS_VM_SIZE']
+        env.IAAS_CNAME_PATTERN = props['IAAS_CNAME_PATTERN']
+        env.IAAS_SV_PORT = props['IAAS_SV_PORT']
+        env.IAAS_SV_ROUTE_PREFIXES = props['IAAS_SV_ROUTE_PREFIXES']
+        env.IAAS_SWAP = props['IAAS_SWAP']
+
+        env.DB_TYPE = props['DB_TYPE']
+        env.DB_SECURITY_ZONE = props['DB_SECURITY_ZONE']
+        env.DB_ENV_TYPE = props['DB_ENV_TYPE']
+
+        env.MESSAGING_ENABLED = props['MESSAGING_ENABLED']
+        env.MESSAGING_TOPIC1_NAME = props['MESSAGING_TOPIC1_NAME']
+        env.MESSAGING_TOPIC2_NAME = props['MESSAGING_TOPIC2_NAME']
+        env.MESSAGING_TOPIC_LOCATION = props['MESSAGING_TOPIC_LOCATION']
+        env.MESSAGING_TOPIC_LEVEL = props['MESSAGING_TOPIC_LEVEL']
+
+        env.SV_TYPE = props['SV_TYPE']
+
+        if(env.ENVIRONMENT == 'ephemeral-app-atl') {
+             env.TF_DIR = "env/iaas/tf/app/"
+        } else{
+            env.TF_DIR = "env/iaas/tf/sv/"
+        }
+        
+        sh("cat ${env.TF_DIR}template.tfvars")
+
+        String filenew = readFile("${env.TF_DIR}/template.tfvars")
+                .replaceAll('IAAS_DEPLOYMENT_NAME',"${env.IAAS_DEPLOYMENT_NAME}")
+                .replaceAll('ENV_TYPE',"${env.ENV_TYPE}")
+                .replaceAll('LOCATIONS',"${env.LOCATIONS}")
+                .replaceAll('IAAS_INSTANCES',"${env.IAAS_INSTANCES}")
+                .replaceAll('IAAS_VM_SIZE',"${env.IAAS_VM_SIZE}")
+                .replaceAll('IAAS_CNAME_PATTERN',"${env.IAAS_CNAME_PATTERN}")
+                .replaceAll('IAAS_SV_PORT',"${env.IAAS_SV_PORT}")
+                .replaceAll('IAAS_SV_ROUTE_PREFIXES',"${env.IAAS_SV_ROUTE_PREFIXES}")
+                .replaceAll('IAAS_SWAP',"${env.IAAS_SWAP}")
+                .replaceAll(',','","')
+        writeFile file:"${env.TF_DIR}${env.ENVIRONMENT}.tfvars", text: filenew
+
+        sh("cat ${env.TF_DIR}${env.ENVIRONMENT}.tfvars")
+    }
+}
+
+def populateHosts(){
+    script {
+        if (!env.IAAS_JWT?.trim()) {
+            env.IAAS_JWT = purpleID.getJwt(iaas.getOktaIssuer(),'$OKTA_CREDS_USR','$OKTA_CREDS_PSW','$PROXY', true)
+        }
+        def cloudOpsHosts = iaas.getHostnamesForDeployment("${env.IAAS_JWT}","${env.ENV_TYPE}","${env.IAAS_DEPLOYMENT_NAME}")
+        echo "VM List: ${cloudOpsHosts}"
+        return cloudOpsHosts
+    }
+}
+
+def provisionVMs(String directory, String envName){
+    withEnv(["http_proxy=${PROXY}","https_proxy=${PROXY}","TF_VAR_client_id=${OKTA_CREDS_USR}","TF_VAR_secret=${OKTA_CREDS_PSW}","TF_VAR_issuer=${iaas.getOktaIssuer()}","TF_VAR_mf_broker_host=${iaas.getBrokerHostname()}","AWS_ACCESS_KEY_ID=${S3_CREDS_USR}","AWS_SECRET_ACCESS_KEY=${S3_CREDS_PSW}","AWS_S3_ENDPOINT=${S3_ENDPOINT}"],) {
+        println "Provisioning cloudops environment from ${GIT_BRANCH}"
+        sh 'pwd'
+        dir(directory) {
+            sh 'terraform init -input=false'
+            script {
+                def environmentName = "${envName}"
+                try {
+                    sh "terraform workspace new ${environmentName}"
+                } catch (Exception e) {
+                    sh 'terraform workspace list'
+                }
+                sh "terraform workspace select ${environmentName}"
+                sh "terraform apply -var-file=\"${environmentName}.tfvars\" -auto-approve"
+                sh 'terraform show -json'
+            }
+        }
+    }
+}
+
+def creategoldcopy() {
+    script {
+        if (!env.DB_JWT?.trim()) {
+            // refer to https://github.com/FedEx/eai-6143-reference-pipeline/blob/master/vars/purpleID.groovy to see what this method does
+            env.DB_JWT = purpleID.getJwt(ephemeralDB.getOktaIssuer(),'$OKTA_CREDS_USR','$OKTA_CREDS_PSW','$PROXY', true)
+        }
+        env.LOCATIONS.split(',').each { location ->
+            location = location.toUpperCase();
+            println location
+            // refer to https://github.com/FedEx/eai-6143-reference-pipeline/blob/master/vars/ephemeralDB.groovy to see what this method does           
+	   ephemeralDB.createGoldCopyFromPdb("${env.DB_JWT}", "${GOLD_COPY}", "${PDB_LABELNAME}", "${EAI_NUMBER}")
+        }
+    }
+}
+
+def createDB() {
+    script {
+        if (!env.DB_JWT?.trim()) {
+            env.DB_JWT = purpleID.getJwt(ephemeralDB.getOktaIssuer(),'$OKTA_CREDS_USR','$OKTA_CREDS_PSW','$PROXY', true)
+        }
+        env.LOCATIONS.split(',').each { location ->
+            location = location.toUpperCase();
+            println location
+	    ephemeralDB.provisionPdbFromGoldCopy("${env.DB_JWT}", "${GOLD_COPY}", "${EAI_NUMBER}", "${PDB_LABELNAME}", "${location}", "${env.DB_SECURITY_ZONE}", "${env.DB_ENV_TYPE}")           
+        }
+    }
+}
+
+def provisionJMS(String type, String location, String level, String clientType, String destination) {
+    withEnv(["http_proxy=${PROXY}", "https_proxy=${PROXY}"],) {
+        println("Provisioning JMS. TYPE: ${type}   LOCATION: ${location}   LEVEL: ${level}    CLIENT TYPE: ${clientType} SUFFIX: ${params.ENVIRONMENT}")
+        if (!env.JMS_JWT?.trim()) {
+            env.JMS_JWT = purpleID.getJwt(ephemeralJMS.getOktaIssuer(),'$OKTA_CREDS_USR','$OKTA_CREDS_PSW','$PROXY', true)
+        }
+
+        ephemeralJMS.provisionJMS("${env.JMS_JWT}", "${type}", "${location}", "${level}", "${clientType}", "${destination}", "${params.ENVIRONMENT.toUpperCase()}")
+    }
+}
+
+def deployServiceVirtualization() {
+    script {
+        if (!env.CLOUDOPS_HOSTS?.trim()) {
+            env.CLOUDOPS_HOSTS = populateHosts()
+        }
+        if (env.SV_TYPE == "wiremock"){
+            sh '''
+			wget $WIREMOCK_DOWNLOAD
+			mv $WIREMOCK_ORIG_JAR_NAME $WIREMOCK_JAR_NAME
+			'''
+            def postDeployScript = """
+			cd ${WIREMOCK_CURRENT_DIR} && pwd && ls -l && chmod 754 *_wiremock && ${WIREMOCK_START_CMD} ${IAAS_SV_PORT}
+			""".stripIndent()
+
+            // refer to https://github.com/FedEx/eai-6143-reference-pipeline/blob/master/vars/iaas.groovy to see what this method does
+            iaas.deploy("${SSH_AGENT}", "${SSH_USER}", "${SSH_OPTIONS}", "${env.CLOUDOPS_HOSTS}", "${WIREMOCK_VERSION_DIR}", "${WIREMOCK_CURRENT_DIR}", "${WIREMOCK_DEPLOY_FILES}", "${postDeployScript}")
+        }
+    }
+}
+
+def undeployServiceVirtualization() {
+    script {
+        if (!env.CLOUDOPS_HOSTS?.trim()) {
+            env.CLOUDOPS_HOSTS = populateHosts()
+        }
+            iaas.runCmd("${SSH_AGENT}", "${SSH_USER}", "${SSH_OPTIONS}", "${env.CLOUDOPS_HOSTS}", "${WIREMOCK_CURRENT_DIR}", "${WIREMOCK_STOP_CMD}", false)
+            iaas.undeploy("${SSH_AGENT}", "${SSH_USER}", "${SSH_OPTIONS}", "${env.CLOUDOPS_HOSTS}", "${WIREMOCK_VERSION_DIR}", "${WIREMOCK_CURRENT_DIR}")
+    }
+}
+
+def deprovisionJMS(String destination) {
+    withEnv(["http_proxy=${PROXY}", "https_proxy=${PROXY}"],) {
+        println("DeProvisioning JMS. DESTINATION: ${destination}")
+        if (!env.JMS_JWT?.trim()) {
+            env.JMS_JWT = purpleID.getJwt(ephemeralJMS.getOktaIssuer(),'$OKTA_CREDS_USR','$OKTA_CREDS_PSW','$PROXY', true)
+        }
+        ephemeralJMS.deprovisionJMSV2("${env.JMS_JWT}", "${destination}")
+    }
+}
+
+def deletegoldcopy() {
+    script {
+        if (!env.DB_JWT?.trim()) {
+            env.DB_JWT = purpleID.getJwt(ephemeralDB.getOktaIssuer(),'$OKTA_CREDS_USR','$OKTA_CREDS_PSW','$PROXY', true)
+        }
+                    
+         ephemeralDB.deleteGoldCopy("${env.DB_JWT}","${GOLD_COPY_ID}")
+    }
+}
+
+def deleteDB() {
+    script {
+        if (!env.DB_JWT?.trim()) {
+            env.DB_JWT = purpleID.getJwt(ephemeralDB.getOktaIssuer(),'$OKTA_CREDS_USR','$OKTA_CREDS_PSW','$PROXY', true)
+        }
+        ephemeralDB.deprovisionPdb("${env.DB_JWT}","${EAI_NUMBER}","${PDB_LABELNAME}")
+    }
+}
+
+def deprovisionVMs(String directory, String envName){
+    withEnv(["http_proxy=${PROXY}", "https_proxy=${PROXY}", "TF_VAR_client_id=${OKTA_CREDS_USR}", "TF_VAR_secret=${OKTA_CREDS_PSW}", "TF_VAR_issuer=${iaas.getOktaIssuer()}", "TF_VAR_mf_broker_host=${iaas.getBrokerHostname()}", "AWS_ACCESS_KEY_ID=${S3_CREDS_USR}", "AWS_SECRET_ACCESS_KEY=${S3_CREDS_PSW}", "AWS_S3_ENDPOINT=${S3_ENDPOINT}"],) {
+        println "Deprovisioning cloudops environment from ${GIT_BRANCH}"
+        sh 'pwd'
+        dir(directory) {
+            sh 'terraform init -input=false'
+            script {
+                def environmentName = "${envName}"
+                try {
+                    sh "terraform workspace new ${environmentName}"
+                } catch (Exception e) {
+                    sh 'terraform workspace list'
+                }
+                sh "terraform workspace select ${environmentName}"
+                sh "terraform destroy -var-file=\"${environmentName}.tfvars\" -auto-approve"
+            }
+        }
+    }
+}
